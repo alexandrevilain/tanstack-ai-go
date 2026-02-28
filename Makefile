@@ -20,8 +20,8 @@ help: ## Display this help.
 
 ##@ Development
 
-.PHONY: generate mockery
-generate:  ## Generate code.
+.PHONY: generate 
+generate: mockery ## Generate code.
 	$(MOCKERY)
 	go generate ./...
 
