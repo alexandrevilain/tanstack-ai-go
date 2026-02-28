@@ -213,7 +213,7 @@ func TestAgent_Run_ToolCallExecution(t *testing.T) {
 	}))
 
 	// Verify tool call end has result
-	toolEnd := events[3].(ToolCallEndEvent)
+	toolEnd := events[4].(ToolCallEndEvent)
 	g.Expect(toolEnd.ToolCallID).To(Equal("tc-1"))
 	g.Expect(toolEnd.ToolName).To(Equal("greet"))
 	g.Expect(toolEnd.Result).To(Equal(`{"greeting":"Hello, Alice!"}`))
