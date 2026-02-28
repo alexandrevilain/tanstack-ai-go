@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GOLANG_CI_VERSION: v2.10.1
+
+jobs:
+  license:
+    name: Check license on files
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@v6
+      - name: check
+        run: make check-license
+  lint:
+    name: Lint files
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: false
+      - name: lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANG_CI_VERSION }}
+  test:
+    name: Test
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+      - name: test
+        run: make test
