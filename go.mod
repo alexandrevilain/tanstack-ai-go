@@ -1,6 +1,6 @@
 module github.com/alexandrevilain/tanstack-ai-go
 
-go 1.24.2
+go 1.25
 
 require (
 	github.com/google/uuid v1.6.0
