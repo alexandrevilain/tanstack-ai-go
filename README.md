@@ -150,4 +150,4 @@ See `examples/openai-chat/` for a complete working example with a frontend.
 
 ## License
 
-MIT
+Apache 2.0
