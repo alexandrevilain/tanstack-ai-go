@@ -41,6 +41,21 @@ const (
 	MessagePartTypeToolResult MessagePartType = "tool-result"
 )
 
+// ToolCallState represents the state of a tool call in the approval flow.
+type ToolCallState string
+
+const (
+	ToolCallStateApprovalRequested ToolCallState = "approval-requested"
+	ToolCallStateApprovalResponded ToolCallState = "approval-responded"
+)
+
+// ToolCallApproval holds approval metadata for a tool call.
+type ToolCallApproval struct {
+	ID            string `json:"id"`
+	NeedsApproval bool   `json:"needsApproval"`
+	Approved      *bool  `json:"approved,omitempty"`
+}
+
 // MessagePart represents a part of a message in the AG-UI protocol.
 // This is a union type — fields are relevant depending on Type:
 //   - "text": Content
@@ -60,6 +75,10 @@ type MessagePart struct {
 	// tool-result fields
 	ToolCallID string `json:"toolCallId,omitempty"` // tool-result: references a tool-call ID
 	Error      string `json:"error,omitempty"`      // tool-result: error message if failed
+
+	// tool-call approval fields
+	State    ToolCallState     `json:"state,omitempty"`    // tool-call: approval state
+	Approval *ToolCallApproval `json:"approval,omitempty"` // tool-call: approval metadata
 }
 
 // ToolCallFunction holds the function name and JSON-encoded arguments.
@@ -142,10 +161,11 @@ type ToolExecuteFunc func(ctx context.Context, args map[string]any) (any, error)
 
 // Tool defines a tool/function that the model can call.
 type Tool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	InputSchema map[string]any  `json:"inputSchema,omitempty"`
-	Execute     ToolExecuteFunc `json:"-"`
+	Name          string          `json:"name"`
+	Description   string          `json:"description"`
+	InputSchema   map[string]any  `json:"inputSchema,omitempty"`
+	NeedsApproval bool            `json:"needsApproval,omitempty"`
+	Execute       ToolExecuteFunc `json:"-"`
 }
 
 // RunInput holds data from an incoming chat request.
