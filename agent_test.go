@@ -775,6 +775,282 @@ func TestConvertProviderUsage(t *testing.T) {
 	}
 }
 
+func TestExtractApprovals(t *testing.T) {
+	t.Parallel()
+
+	boolPtr := func(b bool) *bool { return &b }
+
+	tests := map[string]struct {
+		messages []Message
+		expected map[string]bool
+	}{
+		"no approval messages": {
+			messages: []Message{
+				{Role: RoleUser, Parts: []MessagePart{NewTextPart("hi")}},
+			},
+			expected: map[string]bool{},
+		},
+		"approval responded with approved true": {
+			messages: []Message{
+				{Role: RoleAssistant, Parts: []MessagePart{
+					{
+						Type:      MessagePartTypeToolCall,
+						ID:        "tc-1",
+						Name:      "danger",
+						Arguments: `{"x":1}`,
+						State:     ToolCallStateApprovalResponded,
+						Approval:  &ToolCallApproval{ID: "approval-1", NeedsApproval: true, Approved: boolPtr(true)},
+					},
+				}},
+			},
+			expected: map[string]bool{"tc-1": true},
+		},
+		"approval responded with approved false": {
+			messages: []Message{
+				{Role: RoleAssistant, Parts: []MessagePart{
+					{
+						Type:      MessagePartTypeToolCall,
+						ID:        "tc-1",
+						Name:      "danger",
+						Arguments: `{"x":1}`,
+						State:     ToolCallStateApprovalResponded,
+						Approval:  &ToolCallApproval{ID: "approval-1", NeedsApproval: true, Approved: boolPtr(false)},
+					},
+				}},
+			},
+			expected: map[string]bool{"tc-1": false},
+		},
+		"ignores approval-requested state": {
+			messages: []Message{
+				{Role: RoleAssistant, Parts: []MessagePart{
+					{
+						Type:      MessagePartTypeToolCall,
+						ID:        "tc-1",
+						Name:      "danger",
+						Arguments: `{"x":1}`,
+						State:     ToolCallStateApprovalRequested,
+						Approval:  &ToolCallApproval{ID: "approval-1", NeedsApproval: true},
+					},
+				}},
+			},
+			expected: map[string]bool{},
+		},
+		"ignores non-assistant messages": {
+			messages: []Message{
+				{Role: RoleUser, Parts: []MessagePart{
+					{
+						Type:      MessagePartTypeToolCall,
+						ID:        "tc-1",
+						Name:      "danger",
+						State:     ToolCallStateApprovalResponded,
+						Approval:  &ToolCallApproval{ID: "approval-1", NeedsApproval: true, Approved: boolPtr(true)},
+					},
+				}},
+			},
+			expected: map[string]bool{},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			result := extractApprovals(test.messages)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestAgent_Run_ToolApprovalFlow(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	p := NewMockProvider(t)
+	p.EXPECT().
+		ChatStream(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, _ []Message, _ []Tool, _ string, sink provider.EventSink) error {
+			_ = sink(provider.ToolCallStartEvent{ToolCallID: "tc-1", ToolName: "danger"})
+			_ = sink(provider.ToolCallDeltaEvent{ToolCallID: "tc-1", ArgsDelta: `{"action":"delete"}`})
+			_ = sink(provider.StreamEndEvent{FinishReason: provider.FinishReasonToolCalls})
+			return nil
+		})
+
+	dangerTool := Tool{
+		Name:          "danger",
+		NeedsApproval: true,
+		Execute: func(_ context.Context, _ map[string]any) (any, error) {
+			return "executed", nil
+		},
+	}
+
+	agent := NewAgent(p,
+		WithTools(dangerTool),
+		WithIDGenerator(sequentialIDGenerator()),
+	)
+	var events []Event
+	err := agent.Run(context.Background(), RunInput{Model: "test"}, collectEvents(&events))
+
+	g.Expect(err).ToNot(HaveOccurred())
+	// Should only call provider once — loop stops because approval is needed
+	p.AssertNumberOfCalls(t, "ChatStream", 1)
+
+	types := eventTypes(events)
+	g.Expect(types).To(Equal([]EventType{
+		EventTypeRunStarted,
+		EventTypeToolCallStart,
+		EventTypeToolCallArgs,
+		EventTypeToolCallEnd, // end without result (pending approval)
+		EventTypeCustom,      // approval-requested
+		EventTypeRunFinished,
+	}))
+
+	// Verify the CUSTOM event
+	customEvt := events[4].(CustomEvent)
+	g.Expect(customEvt.Name).To(Equal("approval-requested"))
+
+	value, ok := customEvt.Value.(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(value["toolCallId"]).To(Equal("tc-1"))
+	g.Expect(value["toolName"]).To(Equal("danger"))
+}
+
+func TestAgent_Run_ToolApprovalApproved(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	boolPtr := func(b bool) *bool { return &b }
+
+	callIndex := 0
+	p := NewMockProvider(t)
+	p.EXPECT().
+		ChatStream(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, _ []Message, _ []Tool, _ string, sink provider.EventSink) error {
+			defer func() { callIndex++ }()
+			// After approval is handled, model is called to produce final response.
+			_ = sink(provider.TextDeltaEvent{Delta: "Done!"})
+			_ = sink(provider.StreamEndEvent{FinishReason: provider.FinishReasonStop})
+			return nil
+		})
+
+	var executed bool
+	dangerTool := Tool{
+		Name:          "danger",
+		NeedsApproval: true,
+		Execute: func(_ context.Context, _ map[string]any) (any, error) {
+			executed = true
+			return map[string]string{"status": "deleted"}, nil
+		},
+	}
+
+	agent := NewAgent(p,
+		WithTools(dangerTool),
+		WithIDGenerator(sequentialIDGenerator()),
+	)
+
+	// Simulate second call with approval response in messages
+	var events []Event
+	err := agent.Run(context.Background(), RunInput{
+		Model: "test",
+		Messages: []Message{
+			{Role: RoleUser, Parts: []MessagePart{NewTextPart("delete stuff")}},
+			{Role: RoleAssistant, Parts: []MessagePart{
+				{
+					Type:      MessagePartTypeToolCall,
+					ID:        "tc-1",
+					Name:      "danger",
+					Arguments: `{"action":"delete"}`,
+					State:     ToolCallStateApprovalResponded,
+					Approval:  &ToolCallApproval{ID: "approval-1", NeedsApproval: true, Approved: boolPtr(true)},
+				},
+			}},
+		},
+	}, collectEvents(&events))
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(executed).To(BeTrue())
+
+	types := eventTypes(events)
+	g.Expect(types).To(Equal([]EventType{
+		EventTypeRunStarted,
+		EventTypeToolCallEnd, // result from approved tool
+		// Model called after tool execution
+		EventTypeTextMessageStart,
+		EventTypeTextMessageContent,
+		EventTypeTextMessageEnd,
+		EventTypeRunFinished,
+	}))
+
+	// Verify tool call end has result
+	toolEnd := events[1].(ToolCallEndEvent)
+	g.Expect(toolEnd.ToolCallID).To(Equal("tc-1"))
+	g.Expect(toolEnd.Result).To(Equal(`{"status":"deleted"}`))
+}
+
+func TestAgent_Run_ToolApprovalDenied(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	boolPtr := func(b bool) *bool { return &b }
+
+	p := NewMockProvider(t)
+	p.EXPECT().
+		ChatStream(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, _ []Message, _ []Tool, _ string, sink provider.EventSink) error {
+			_ = sink(provider.TextDeltaEvent{Delta: "OK, I won't do that."})
+			_ = sink(provider.StreamEndEvent{FinishReason: provider.FinishReasonStop})
+			return nil
+		})
+
+	dangerTool := Tool{
+		Name:          "danger",
+		NeedsApproval: true,
+		Execute: func(_ context.Context, _ map[string]any) (any, error) {
+			t.Fatal("should not be called when denied")
+			return nil, nil
+		},
+	}
+
+	agent := NewAgent(p,
+		WithTools(dangerTool),
+		WithIDGenerator(sequentialIDGenerator()),
+	)
+
+	var events []Event
+	err := agent.Run(context.Background(), RunInput{
+		Model: "test",
+		Messages: []Message{
+			{Role: RoleUser, Parts: []MessagePart{NewTextPart("delete stuff")}},
+			{Role: RoleAssistant, Parts: []MessagePart{
+				{
+					Type:      MessagePartTypeToolCall,
+					ID:        "tc-1",
+					Name:      "danger",
+					Arguments: `{"action":"delete"}`,
+					State:     ToolCallStateApprovalResponded,
+					Approval:  &ToolCallApproval{ID: "approval-1", NeedsApproval: true, Approved: boolPtr(false)},
+				},
+			}},
+		},
+	}, collectEvents(&events))
+
+	g.Expect(err).ToNot(HaveOccurred())
+
+	types := eventTypes(events)
+	g.Expect(types).To(Equal([]EventType{
+		EventTypeRunStarted,
+		EventTypeToolCallEnd, // denied result
+		// Model continues after denial
+		EventTypeTextMessageStart,
+		EventTypeTextMessageContent,
+		EventTypeTextMessageEnd,
+		EventTypeRunFinished,
+	}))
+
+	// Verify tool call end has denied result
+	toolEnd := events[1].(ToolCallEndEvent)
+	g.Expect(toolEnd.Result).To(ContainSubstring("User denied this action"))
+}
+
 // eventTypes extracts EventType from a slice of events.
 func eventTypes(events []Event) []EventType {
 	types := make([]EventType, len(events))

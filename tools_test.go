@@ -159,18 +159,23 @@ func TestToolCallManager_Clear(t *testing.T) {
 }
 
 func TestExecuteToolCalls(t *testing.T) {
+	idGen := func(prefix string) string { return prefix + "-test" }
+
 	tests := map[string]struct {
 		toolCalls []ToolCall
 		tools     []Tool
-		expected  []ToolResult
+		approvals map[string]bool
+		expected  ToolExecutionResult
 	}{
 		"unknown tool": {
 			toolCalls: []ToolCall{
 				{ID: "tc-1", Type: "function", Function: ToolCallFunction{Name: "unknown", Arguments: "{}"}},
 			},
 			tools: nil,
-			expected: []ToolResult{
-				{ToolCallID: "tc-1", ToolName: "unknown", Content: `{"error":"unknown tool: unknown"}`},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "unknown", Content: `{"error":"unknown tool: unknown"}`},
+				},
 			},
 		},
 		"tool with nil execute": {
@@ -180,8 +185,10 @@ func TestExecuteToolCalls(t *testing.T) {
 			tools: []Tool{
 				{Name: "client_tool", Description: "client-side only"},
 			},
-			expected: []ToolResult{
-				{ToolCallID: "tc-1", ToolName: "client_tool", Content: `{"error":"tool has no server-side execute function"}`},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "client_tool", Content: `{"error":"tool has no server-side execute function"}`},
+				},
 			},
 		},
 		"invalid json arguments": {
@@ -196,8 +203,10 @@ func TestExecuteToolCalls(t *testing.T) {
 					},
 				},
 			},
-			expected: []ToolResult{
-				{ToolCallID: "tc-1", ToolName: "my_tool", Content: `{"error":"invalid arguments: invalid character 'o' in literal null (expecting 'u')"}`},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "my_tool", Content: `{"error":"invalid arguments: invalid character 'o' in literal null (expecting 'u')"}`},
+				},
 			},
 		},
 		"empty arguments defaults to empty object": {
@@ -212,8 +221,10 @@ func TestExecuteToolCalls(t *testing.T) {
 					},
 				},
 			},
-			expected: []ToolResult{
-				{ToolCallID: "tc-1", ToolName: "my_tool", Content: `{"count":0}`},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "my_tool", Content: `{"count":0}`},
+				},
 			},
 		},
 		"successful execution": {
@@ -228,8 +239,10 @@ func TestExecuteToolCalls(t *testing.T) {
 					},
 				},
 			},
-			expected: []ToolResult{
-				{ToolCallID: "tc-1", ToolName: "greet", Content: `{"greeting":"Hello, Alice!"}`},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "greet", Content: `{"greeting":"Hello, Alice!"}`},
+				},
 			},
 		},
 		"execute returns error": {
@@ -244,8 +257,10 @@ func TestExecuteToolCalls(t *testing.T) {
 					},
 				},
 			},
-			expected: []ToolResult{
-				{ToolCallID: "tc-1", ToolName: "fail_tool", Content: `{"error":"something went wrong"}`},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "fail_tool", Content: `{"error":"something went wrong"}`},
+				},
 			},
 		},
 		"multiple tool calls executed in order": {
@@ -263,9 +278,99 @@ func TestExecuteToolCalls(t *testing.T) {
 					},
 				},
 			},
-			expected: []ToolResult{
-				{ToolCallID: "tc-1", ToolName: "add", Content: `{"sum":3}`},
-				{ToolCallID: "tc-2", ToolName: "add", Content: `{"sum":7}`},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "add", Content: `{"sum":3}`},
+					{ToolCallID: "tc-2", ToolName: "add", Content: `{"sum":7}`},
+				},
+			},
+		},
+		"needs approval with no prior decision": {
+			toolCalls: []ToolCall{
+				{ID: "tc-1", Type: "function", Function: ToolCallFunction{Name: "danger", Arguments: `{"action":"delete"}`}},
+			},
+			tools: []Tool{
+				{
+					Name:          "danger",
+					NeedsApproval: true,
+					Execute: func(_ context.Context, _ map[string]any) (any, error) {
+						return "done", nil
+					},
+				},
+			},
+			expected: ToolExecutionResult{
+				NeedsApproval: []ApprovalRequest{
+					{ToolCallID: "tc-1", ToolName: "danger", Input: map[string]any{"action": "delete"}, ApprovalID: "approval-test"},
+				},
+			},
+		},
+		"needs approval with approved decision": {
+			toolCalls: []ToolCall{
+				{ID: "tc-1", Type: "function", Function: ToolCallFunction{Name: "danger", Arguments: `{"action":"delete"}`}},
+			},
+			tools: []Tool{
+				{
+					Name:          "danger",
+					NeedsApproval: true,
+					Execute: func(_ context.Context, _ map[string]any) (any, error) {
+						return map[string]string{"status": "deleted"}, nil
+					},
+				},
+			},
+			approvals: map[string]bool{"tc-1": true},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "danger", Content: `{"status":"deleted"}`},
+				},
+			},
+		},
+		"needs approval with denied decision": {
+			toolCalls: []ToolCall{
+				{ID: "tc-1", Type: "function", Function: ToolCallFunction{Name: "danger", Arguments: `{"action":"delete"}`}},
+			},
+			tools: []Tool{
+				{
+					Name:          "danger",
+					NeedsApproval: true,
+					Execute: func(_ context.Context, _ map[string]any) (any, error) {
+						return "done", nil
+					},
+				},
+			},
+			approvals: map[string]bool{"tc-1": false},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "danger", Content: `{"approved":false,"message":"User denied this action"}`},
+				},
+			},
+		},
+		"mix of approval and non-approval tools": {
+			toolCalls: []ToolCall{
+				{ID: "tc-1", Type: "function", Function: ToolCallFunction{Name: "safe", Arguments: `{}`}},
+				{ID: "tc-2", Type: "function", Function: ToolCallFunction{Name: "danger", Arguments: `{"x":1}`}},
+			},
+			tools: []Tool{
+				{
+					Name: "safe",
+					Execute: func(_ context.Context, _ map[string]any) (any, error) {
+						return "ok", nil
+					},
+				},
+				{
+					Name:          "danger",
+					NeedsApproval: true,
+					Execute: func(_ context.Context, _ map[string]any) (any, error) {
+						return "done", nil
+					},
+				},
+			},
+			expected: ToolExecutionResult{
+				Results: []ToolResult{
+					{ToolCallID: "tc-1", ToolName: "safe", Content: `"ok"`},
+				},
+				NeedsApproval: []ApprovalRequest{
+					{ToolCallID: "tc-2", ToolName: "danger", Input: map[string]any{"x": float64(1)}, ApprovalID: "approval-test"},
+				},
 			},
 		},
 	}
@@ -275,8 +380,8 @@ func TestExecuteToolCalls(t *testing.T) {
 			t.Parallel()
 			g := NewWithT(t)
 
-			results := ExecuteToolCalls(context.Background(), test.toolCalls, test.tools)
-			g.Expect(results).To(Equal(test.expected))
+			result := ExecuteToolCalls(context.Background(), test.toolCalls, test.tools, test.approvals, idGen)
+			g.Expect(result).To(Equal(test.expected))
 		})
 	}
 }

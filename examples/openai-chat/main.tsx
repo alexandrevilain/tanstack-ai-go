@@ -6,7 +6,7 @@ import { useChat, fetchServerSentEvents } from "@tanstack/ai-react";
 const Chat = () => {
   const [input, setInput] = useState("");
 
-  const { messages, sendMessage, isLoading } = useChat({
+  const { messages, sendMessage, addToolApprovalResponse, isLoading } = useChat({
     connection: fetchServerSentEvents("/api/chat"),
   });
 
@@ -46,6 +46,48 @@ const Chat = () => {
                 }
                 if (part.type === "text") {
                   return <div key={idx}>{part.content}</div>;
+                }
+                if (
+                  part.type === "tool-call" &&
+                  part.state === "approval-requested" &&
+                  part.approval
+                ) {
+                  return (
+                    <div
+                      key={idx}
+                      className="my-2 p-3 border border-yellow-300 bg-yellow-50 rounded-lg"
+                    >
+                      <div className="text-sm text-gray-700 mb-2">
+                        Tool <span className="font-semibold">{part.toolName}</span> requires approval
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() =>
+                            addToolApprovalResponse({
+                              id: part.approval!.id,
+                              approved: true,
+                            })
+                          }
+                          disabled={isLoading}
+                          className="px-4 py-1 bg-green-600 text-white text-sm rounded disabled:opacity-50"
+                        >
+                          Approve
+                        </button>
+                        <button
+                          onClick={() =>
+                            addToolApprovalResponse({
+                              id: part.approval!.id,
+                              approved: false,
+                            })
+                          }
+                          disabled={isLoading}
+                          className="px-4 py-1 bg-red-600 text-white text-sm rounded disabled:opacity-50"
+                        >
+                          Deny
+                        </button>
+                      </div>
+                    </div>
+                  );
                 }
                 return null;
               })}
