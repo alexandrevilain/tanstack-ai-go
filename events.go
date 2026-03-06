@@ -252,3 +252,23 @@ func NewToolCallEndEvent(toolCallID, toolName string) ToolCallEndEvent {
 		Timestamp:  now(),
 	}
 }
+
+// CustomEvent represents a custom AG-UI event.
+type CustomEvent struct {
+	Type      EventType `json:"type"`
+	Name      string    `json:"name"`
+	Value     any       `json:"value,omitempty"`
+	Timestamp int64     `json:"timestamp"`
+}
+
+func (e CustomEvent) EventType() EventType { return e.Type }
+
+// NewCustomEvent creates a new CustomEvent with the given name and value.
+func NewCustomEvent(name string, value any) CustomEvent {
+	return CustomEvent{
+		Type:      EventTypeCustom,
+		Name:      name,
+		Value:     value,
+		Timestamp: now(),
+	}
+}

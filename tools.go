@@ -90,18 +90,35 @@ type ToolResult struct {
 	Content    string
 }
 
+// ApprovalRequest represents a tool call that needs user approval before execution.
+type ApprovalRequest struct {
+	ToolCallID string `json:"toolCallId"`
+	ToolName   string `json:"toolName"`
+	Input      any    `json:"input"`
+	ApprovalID string `json:"approvalId"`
+}
+
+// ToolExecutionResult holds the outcome of ExecuteToolCalls, including
+// completed results and any tool calls that need user approval.
+type ToolExecutionResult struct {
+	Results       []ToolResult
+	NeedsApproval []ApprovalRequest
+}
+
 // ExecuteToolCalls executes all tool calls against the registered tools.
-func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool) []ToolResult {
+// The approvals map contains approval decisions keyed by tool call ID (true = approved, false = denied).
+// Tool calls requiring approval that have no decision in the map are returned in NeedsApproval.
+func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool, approvals map[string]bool, idGenerator IDGenerator) ToolExecutionResult {
 	toolMap := make(map[string]Tool, len(tools))
 	for _, t := range tools {
 		toolMap[t.Name] = t
 	}
 
-	results := make([]ToolResult, 0, len(toolCalls))
+	var result ToolExecutionResult
 	for _, tc := range toolCalls {
 		tool, ok := toolMap[tc.Function.Name]
 		if !ok {
-			results = append(results, ToolResult{
+			result.Results = append(result.Results, ToolResult{
 				ToolCallID: tc.ID,
 				ToolName:   tc.Function.Name,
 				Content:    toolErrorContent(fmt.Sprintf("unknown tool: %s", tc.Function.Name)),
@@ -109,12 +126,47 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool) [
 			continue
 		}
 		if tool.Execute == nil {
-			results = append(results, ToolResult{
+			result.Results = append(result.Results, ToolResult{
 				ToolCallID: tc.ID,
 				ToolName:   tc.Function.Name,
 				Content:    toolErrorContent("tool has no server-side execute function"),
 			})
 			continue
+		}
+
+		// Handle approval flow for tools that need approval.
+		if tool.NeedsApproval {
+			approved, hasDecision := approvals[tc.ID]
+			if !hasDecision {
+				// Parse input for the approval request.
+				var input any
+				argsStr := tc.Function.Arguments
+				if argsStr == "" {
+					argsStr = "{}"
+				}
+				_ = json.Unmarshal([]byte(argsStr), &input)
+
+				result.NeedsApproval = append(result.NeedsApproval, ApprovalRequest{
+					ToolCallID: tc.ID,
+					ToolName:   tc.Function.Name,
+					Input:      input,
+					ApprovalID: idGenerator("approval"),
+				})
+				continue
+			}
+			if !approved {
+				denied, _ := json.Marshal(map[string]any{
+					"approved": false,
+					"message":  "User denied this action",
+				})
+				result.Results = append(result.Results, ToolResult{
+					ToolCallID: tc.ID,
+					ToolName:   tc.Function.Name,
+					Content:    string(denied),
+				})
+				continue
+			}
+			// approved == true: fall through to execute normally
 		}
 
 		var args map[string]any
@@ -123,7 +175,7 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool) [
 			argsStr = "{}"
 		}
 		if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
-			results = append(results, ToolResult{
+			result.Results = append(result.Results, ToolResult{
 				ToolCallID: tc.ID,
 				ToolName:   tc.Function.Name,
 				Content:    toolErrorContent(fmt.Sprintf("invalid arguments: %s", err)),
@@ -131,9 +183,9 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool) [
 			continue
 		}
 
-		result, err := tool.Execute(ctx, args)
+		execResult, err := tool.Execute(ctx, args)
 		if err != nil {
-			results = append(results, ToolResult{
+			result.Results = append(result.Results, ToolResult{
 				ToolCallID: tc.ID,
 				ToolName:   tc.Function.Name,
 				Content:    toolErrorContent(err.Error()),
@@ -141,17 +193,17 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool) [
 			continue
 		}
 
-		encoded, err := json.Marshal(result)
+		encoded, err := json.Marshal(execResult)
 		if err != nil {
 			encoded = []byte(toolErrorContent(fmt.Sprintf("marshal result: %s", err)))
 		}
-		results = append(results, ToolResult{
+		result.Results = append(result.Results, ToolResult{
 			ToolCallID: tc.ID,
 			ToolName:   tc.Function.Name,
 			Content:    string(encoded),
 		})
 	}
-	return results
+	return result
 }
 
 func toolErrorContent(message string) string {

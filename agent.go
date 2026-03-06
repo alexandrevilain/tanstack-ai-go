@@ -83,6 +83,9 @@ func (a *Agent) Run(ctx context.Context, input RunInput, sink EventSink) error {
 		return err
 	}
 
+	// Extract approval decisions from incoming messages.
+	approvals := extractApprovals(input.Messages)
+
 	// All per-request state is local
 	messages := prependSystemPrompts(input.Messages, a.systemPrompt)
 	toolMgr := NewToolCallManager()
@@ -90,9 +93,36 @@ func (a *Agent) Run(ctx context.Context, input RunInput, sink EventSink) error {
 	var lastFinishReason provider.FinishReason
 	totalUsage := &accumulatedUsage{}
 
+	// Check if there are pending approvals to handle before starting the model loop.
+	// When the client sends back approval responses, the messages contain the assistant
+	// tool-call message and we need to execute those tools with the approval decisions.
+	var pendingToolCalls []ToolCall
+	if len(approvals) > 0 {
+		pendingToolCalls = extractPendingToolCalls(input.Messages)
+	}
+
 	// Agentic loop
 	var loopErr error
-	for a.strategy(LoopState{
+
+	// If we have pending tool calls from approval responses, handle them first.
+	if len(pendingToolCalls) > 0 {
+		toolMgr.Clear()
+		for _, tc := range pendingToolCalls {
+			toolMgr.AddStart(tc.ID, tc.Function.Name)
+			toolMgr.AddArgs(tc.ID, tc.Function.Arguments)
+		}
+
+		var toolMessages []Message
+		toolMessages, _, loopErr = a.executeToolCalls(ctx, toolMgr, a.tools, provider.FinishReasonToolCalls, approvals, sink)
+		if loopErr == nil && len(toolMessages) > 0 {
+			messages = append(messages, toolMessages...)
+			// Continue with the model loop after handling approvals.
+			lastFinishReason = provider.FinishReasonToolCalls
+			iterationCount++
+		}
+	}
+
+	for loopErr == nil && a.strategy(LoopState{
 		IterationCount: iterationCount,
 		Messages:       messages,
 		FinishReason:   lastFinishReason,
@@ -122,7 +152,7 @@ func (a *Agent) Run(ctx context.Context, input RunInput, sink EventSink) error {
 			toolResults  []ToolResult
 			toolMessages []Message
 		)
-		toolMessages, toolResults, loopErr = a.executeToolCalls(ctx, toolMgr, a.tools, lastFinishReason, sink)
+		toolMessages, toolResults, loopErr = a.executeToolCalls(ctx, toolMgr, a.tools, lastFinishReason, nil, sink)
 		if loopErr != nil {
 			break
 		}
@@ -266,7 +296,8 @@ func (a *Agent) processChat(ctx context.Context, model string, messages []Messag
 
 // executeToolCalls handles tool execution after the model response.
 // It returns new tool-result messages and the tool results.
-func (a *Agent) executeToolCalls(ctx context.Context, toolMgr *ToolCallManager, tools []Tool, finishReason provider.FinishReason, sink EventSink) ([]Message, []ToolResult, error) {
+// The approvals map contains approval decisions keyed by tool call ID.
+func (a *Agent) executeToolCalls(ctx context.Context, toolMgr *ToolCallManager, tools []Tool, finishReason provider.FinishReason, approvals map[string]bool, sink EventSink) ([]Message, []ToolResult, error) {
 	if !toolMgr.HasToolCalls() {
 		return nil, nil, nil
 	}
@@ -285,9 +316,31 @@ func (a *Agent) executeToolCalls(ctx context.Context, toolMgr *ToolCallManager, 
 	}
 
 	// Execute tools and emit TOOL_CALL_END with results
+	execResult := ExecuteToolCalls(ctx, toolCalls, tools, approvals, a.idGenerator)
+
+	// Emit CUSTOM events for tool calls that need approval.
+	for _, req := range execResult.NeedsApproval {
+		endEvent := NewToolCallEndEvent(req.ToolCallID, req.ToolName)
+		if err := sink(endEvent); err != nil {
+			return nil, nil, err
+		}
+
+		if err := sink(NewCustomEvent("approval-requested", map[string]any{
+			"toolCallId": req.ToolCallID,
+			"toolName":   req.ToolName,
+			"input":      req.Input,
+			"approval": map[string]any{
+				"id":            req.ApprovalID,
+				"needsApproval": true,
+			},
+		})); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// Emit results for executed/denied tool calls.
 	var newMessages []Message
-	results := ExecuteToolCalls(ctx, toolCalls, tools)
-	for _, result := range results {
+	for _, result := range execResult.Results {
 		endEvent := NewToolCallEndEvent(result.ToolCallID, result.ToolName)
 		endEvent.Result = result.Content
 		if err := sink(endEvent); err != nil {
@@ -302,7 +355,65 @@ func (a *Agent) executeToolCalls(ctx context.Context, toolMgr *ToolCallManager, 
 		})
 	}
 
-	return newMessages, results, nil
+	// If there are pending approvals, stop the loop by returning no tool messages.
+	// The run will finish and the client will re-call with approval decisions.
+	if len(execResult.NeedsApproval) > 0 {
+		return nil, execResult.Results, nil
+	}
+
+	return newMessages, execResult.Results, nil
+}
+
+// extractApprovals scans messages for tool-call parts with approval responses
+// and returns a map of tool call ID → approved (true/false).
+func extractApprovals(messages []Message) map[string]bool {
+	approvals := make(map[string]bool)
+	for _, msg := range messages {
+		if msg.Role != RoleAssistant {
+			continue
+		}
+		for _, part := range msg.Parts {
+			if part.Type != MessagePartTypeToolCall {
+				continue
+			}
+			if part.State != ToolCallStateApprovalResponded {
+				continue
+			}
+			if part.Approval == nil || part.Approval.Approved == nil {
+				continue
+			}
+			approvals[part.ID] = *part.Approval.Approved
+		}
+	}
+	return approvals
+}
+
+// extractPendingToolCalls extracts tool calls from assistant messages that have
+// approval responses, so they can be re-executed with the approval decisions.
+func extractPendingToolCalls(messages []Message) []ToolCall {
+	var calls []ToolCall
+	for _, msg := range messages {
+		if msg.Role != RoleAssistant {
+			continue
+		}
+		for _, part := range msg.Parts {
+			if part.Type != MessagePartTypeToolCall {
+				continue
+			}
+			if part.State != ToolCallStateApprovalResponded {
+				continue
+			}
+			calls = append(calls, ToolCall{
+				ID:   part.ID,
+				Type: "function",
+				Function: ToolCallFunction{
+					Name:      part.Name,
+					Arguments: part.Arguments,
+				},
+			})
+		}
+	}
+	return calls
 }
 
 func prependSystemPrompts(messages []Message, prompt string) []Message {

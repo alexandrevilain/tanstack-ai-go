@@ -32,10 +32,11 @@ func main() {
 	// Create OpenAI provider (uses OPENAI_API_KEY env var by default)
 	openaiProvider := tsopenai.NewProvider()
 
-	// Define a server-side tool
+	// Define a server-side tool with approval required
 	weatherTool := tanstackai.Tool{
-		Name:        "get_weather",
-		Description: "Get the current weather for a location",
+		Name:          "get_weather",
+		Description:   "Get the current weather for a location",
+		NeedsApproval: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
