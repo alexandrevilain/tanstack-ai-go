@@ -62,216 +62,216 @@ func NewAgent(p Provider, opts ...Option) *Agent {
 
 // Run executes the full agentic loop, emitting all AG-UI events to the sink.
 func (a *Agent) Run(ctx context.Context, input RunInput, sink EventSink) error {
-	threadID := input.ThreadID
-	if threadID == "" {
-		threadID = a.idGenerator("thread")
-	}
-	runID := input.RunID
-	if runID == "" {
-		runID = a.idGenerator("run")
+	r := &agentRun{
+		agent:      a,
+		ctx:        ctx,
+		sink:       sink,
+		model:      input.Model,
+		messages:   prependSystemPrompts(input.Messages, a.systemPrompt),
+		toolMgr:    NewToolCallManager(),
+		totalUsage: &accumulatedUsage{},
 	}
 
+	r.threadID = input.ThreadID
+	if r.threadID == "" {
+		r.threadID = a.idGenerator("thread")
+	}
+	r.runID = input.RunID
+	if r.runID == "" {
+		r.runID = a.idGenerator("run")
+	}
+
+	return r.execute()
+}
+
+// agentRun holds all per-request state for a single Run() invocation.
+type agentRun struct {
+	agent *Agent
+	ctx   context.Context
+	sink  EventSink
+
+	model        string
+	threadID     string
+	runID        string
+	messages     []Message
+	toolMgr      *ToolCallManager
+	totalUsage   *accumulatedUsage
+	finishReason provider.FinishReason
+	iteration    int
+}
+
+// execute runs the full agentic lifecycle: hooks, events, loop, and cleanup.
+func (r *agentRun) execute() error {
 	// Hook: OnRunStart
-	if a.hooks.OnRunStart != nil {
-		if err := a.hooks.OnRunStart(ctx, threadID, runID); err != nil {
+	if r.agent.hooks.OnRunStart != nil {
+		if err := r.agent.hooks.OnRunStart(r.ctx, r.threadID, r.runID); err != nil {
 			return err
 		}
 	}
 
 	// Emit RUN_STARTED
-	if err := sink(NewRunStartedEvent(threadID, runID)); err != nil {
+	if err := r.sink(NewRunStartedEvent(r.threadID, r.runID)); err != nil {
 		return err
 	}
 
-	// Extract approval decisions from incoming messages.
-	approvals := extractApprovals(input.Messages)
-
-	// All per-request state is local
-	messages := prependSystemPrompts(input.Messages, a.systemPrompt)
-	toolMgr := NewToolCallManager()
-	var iterationCount int
-	var lastFinishReason provider.FinishReason
-	totalUsage := &accumulatedUsage{}
-
-	// Check if there are pending approvals to handle before starting the model loop.
-	// When the client sends back approval responses, the messages contain the assistant
-	// tool-call message and we need to execute those tools with the approval decisions.
-	var pendingToolCalls []ToolCall
-	if len(approvals) > 0 {
-		pendingToolCalls = extractPendingToolCalls(input.Messages)
-	}
-
-	// Agentic loop
-	var loopErr error
-
-	// If we have pending tool calls from approval responses, handle them first.
-	if len(pendingToolCalls) > 0 {
-		toolMgr.Clear()
-		for _, tc := range pendingToolCalls {
-			toolMgr.AddStart(tc.ID, tc.Function.Name)
-			toolMgr.AddArgs(tc.ID, tc.Function.Arguments)
-		}
-
-		var toolMessages []Message
-		toolMessages, _, loopErr = a.executeToolCalls(ctx, toolMgr, a.tools, provider.FinishReasonToolCalls, approvals, sink)
-		if loopErr == nil && len(toolMessages) > 0 {
-			messages = append(messages, toolMessages...)
-			// Continue with the model loop after handling approvals.
-			lastFinishReason = provider.FinishReasonToolCalls
-			iterationCount++
-		}
-	}
-
-	for loopErr == nil && a.strategy(LoopState{
-		IterationCount: iterationCount,
-		Messages:       messages,
-		FinishReason:   lastFinishReason,
-	}) {
-		if err := ctx.Err(); err != nil {
-			loopErr = err
-			break
-		}
-
-		// Phase 1: Process model response
-		var (
-			finishReason provider.FinishReason
-			stepUsage    *provider.Usage
-			newMessages  []Message
-		)
-		finishReason, stepUsage, newMessages, loopErr = a.processChat(ctx, input.Model, messages, a.tools, toolMgr, sink)
-		if loopErr != nil {
-			break
-		}
-
-		messages = append(messages, newMessages...)
-		lastFinishReason = finishReason
-		totalUsage.add(stepUsage)
-
-		// Phase 2: Execute any tool calls
-		var (
-			toolResults  []ToolResult
-			toolMessages []Message
-		)
-		toolMessages, toolResults, loopErr = a.executeToolCalls(ctx, toolMgr, a.tools, lastFinishReason, nil, sink)
-		if loopErr != nil {
-			break
-		}
-		if len(toolMessages) > 0 {
-			messages = append(messages, toolMessages...)
-		} else if lastFinishReason == provider.FinishReasonToolCalls {
-			// Tools were present but none were server-side; treat as stop.
-			lastFinishReason = provider.FinishReasonStop
-		}
-
-		// Hook: OnStepFinish
-		if a.hooks.OnStepFinish != nil {
-			stepMessages := []Message{}
-			stepMessages = append(stepMessages, newMessages...)
-			stepMessages = append(stepMessages, toolMessages...)
-
-			stepResult := StepResult{
-				Messages:     stepMessages,
-				Usage:        convertProviderUsage(stepUsage),
-				FinishReason: finishReason,
-				ToolCalls:    toolMgr.GetToolCalls(),
-				ToolResults:  toolResults,
-			}
-			if err := a.hooks.OnStepFinish(ctx, stepResult); err != nil {
-				loopErr = err
-				break
-			}
-		}
-
-		iterationCount++
-	}
+	loopErr := r.loop()
 
 	if loopErr != nil {
-		// Hook: OnError
-		if a.hooks.OnError != nil {
-			if hookErr := a.hooks.OnError(ctx, loopErr); hookErr != nil {
-				return fmt.Errorf("run failed: %w; on error hook: %v", loopErr, hookErr)
-			}
+		return r.handleError(loopErr)
+	}
+
+	return r.handleSuccess()
+}
+
+// loop runs the agentic loop: handle pending approvals, then alternate
+// between processChat and executeToolCalls until the strategy says stop.
+func (r *agentRun) loop() error {
+	// Handle pending approvals before starting the model loop.
+	approvals := extractApprovals(r.messages)
+	if len(approvals) > 0 {
+		if err := r.handlePendingApprovals(approvals); err != nil {
+			return err
+		}
+	}
+
+	for r.agent.strategy(LoopState{
+		IterationCount: r.iteration,
+		Messages:       r.messages,
+		FinishReason:   r.finishReason,
+	}) {
+		if err := r.ctx.Err(); err != nil {
+			return err
 		}
 
-		_ = sink(NewRunErrorEvent(loopErr.Error(), runErrorCode(loopErr), runID))
-		return loopErr
-	}
+		if err := r.step(); err != nil {
+			return err
+		}
 
-	// Emit RUN_FINISHED with accumulated usage
-	finishedEvent := NewRunFinishedEvent(threadID, runID, lastFinishReason)
-	finishedEvent.Usage = totalUsage.toUsage()
-	if err := sink(finishedEvent); err != nil {
-		return err
-	}
-
-	// Hook: OnFinish
-	if a.hooks.OnFinish != nil {
-		return a.hooks.OnFinish(ctx, RunResult{
-			Messages:     messages,
-			Usage:        totalUsage.toUsage(),
-			FinishReason: lastFinishReason,
-			ThreadID:     threadID,
-			RunID:        runID,
-		})
+		r.iteration++
 	}
 
 	return nil
 }
 
-func runErrorCode(err error) string {
-	switch {
-	case errors.Is(err, context.Canceled):
-		return "canceled"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "deadline_exceeded"
-	default:
-		return "internal_error"
+// handlePendingApprovals processes tool calls that have approval responses
+// from the client, executing or denying them before entering the model loop.
+func (r *agentRun) handlePendingApprovals(approvals map[string]bool) error {
+	pendingToolCalls := extractPendingToolCalls(r.messages)
+	if len(pendingToolCalls) == 0 {
+		return nil
 	}
+
+	r.toolMgr.Clear()
+	for _, tc := range pendingToolCalls {
+		r.toolMgr.AddStart(tc.ID, tc.Function.Name)
+		r.toolMgr.AddArgs(tc.ID, tc.Function.Arguments)
+	}
+
+	r.finishReason = provider.FinishReasonToolCalls
+	toolMessages, _, err := r.executeToolCalls(approvals)
+	if err != nil {
+		return err
+	}
+
+	if len(toolMessages) > 0 {
+		r.messages = append(r.messages, toolMessages...)
+		r.finishReason = provider.FinishReasonToolCalls
+		r.iteration++
+	}
+
+	return nil
+}
+
+// step runs one iteration of the agentic loop: model response + tool execution + hooks.
+func (r *agentRun) step() error {
+	// Phase 1: Process model response
+	stepUsage, newMessages, err := r.processChat()
+	if err != nil {
+		return err
+	}
+
+	r.messages = append(r.messages, newMessages...)
+	r.totalUsage.add(stepUsage)
+
+	// Phase 2: Execute any tool calls
+	toolMessages, toolResults, err := r.executeToolCalls(nil)
+	if err != nil {
+		return err
+	}
+
+	if len(toolMessages) > 0 {
+		r.messages = append(r.messages, toolMessages...)
+	} else if r.finishReason == provider.FinishReasonToolCalls {
+		// Tools were present but none were server-side; treat as stop.
+		r.finishReason = provider.FinishReasonStop
+	}
+
+	// Hook: OnStepFinish
+	if r.agent.hooks.OnStepFinish != nil {
+		stepMessages := make([]Message, 0, len(newMessages)+len(toolMessages))
+		stepMessages = append(stepMessages, newMessages...)
+		stepMessages = append(stepMessages, toolMessages...)
+
+		stepResult := StepResult{
+			Messages:     stepMessages,
+			Usage:        convertProviderUsage(stepUsage),
+			FinishReason: r.finishReason,
+			ToolCalls:    r.toolMgr.GetToolCalls(),
+			ToolResults:  toolResults,
+		}
+		if err := r.agent.hooks.OnStepFinish(r.ctx, stepResult); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // processChat streams the model response, translating provider events into AG-UI events.
-// It returns the finish reason, usage, and any new messages to append to conversation history.
-func (a *Agent) processChat(ctx context.Context, model string, messages []Message, tools []Tool, toolMgr *ToolCallManager, outerSink EventSink) (provider.FinishReason, *provider.Usage, []Message, error) {
-	toolMgr.Clear()
+// It returns the step usage and new messages to append to conversation history.
+func (r *agentRun) processChat() (*provider.Usage, []Message, error) {
+	r.toolMgr.Clear()
 
 	var contentBuilder strings.Builder
-	messageID := a.idGenerator("msg")
+	messageID := r.agent.idGenerator("msg")
 	textStarted := false
 	var finishReason provider.FinishReason
 	var usage *provider.Usage
 
-	err := a.provider.ChatStream(ctx, messages, tools, model, func(event provider.Event) error {
+	err := r.agent.provider.ChatStream(r.ctx, r.messages, r.agent.tools, r.model, func(event provider.Event) error {
 		switch ev := event.(type) {
 		case provider.TextDeltaEvent:
 			if !textStarted {
 				textStarted = true
-				if err := outerSink(NewTextMessageStartEvent(messageID, "assistant")); err != nil {
+				if err := r.sink(NewTextMessageStartEvent(messageID, "assistant")); err != nil {
 					return err
 				}
 			}
 			contentBuilder.WriteString(ev.Delta)
-			return outerSink(NewTextMessageContentEvent(messageID, ev.Delta))
+			return r.sink(NewTextMessageContentEvent(messageID, ev.Delta))
 
 		case provider.ToolCallStartEvent:
-			toolMgr.AddStart(ev.ToolCallID, ev.ToolName)
-			return outerSink(NewToolCallStartEvent(ev.ToolCallID, ev.ToolName))
+			r.toolMgr.AddStart(ev.ToolCallID, ev.ToolName)
+			return r.sink(NewToolCallStartEvent(ev.ToolCallID, ev.ToolName))
 
 		case provider.ToolCallDeltaEvent:
-			toolMgr.AddArgs(ev.ToolCallID, ev.ArgsDelta)
-			return outerSink(NewToolCallArgsEvent(ev.ToolCallID, ev.ArgsDelta))
+			r.toolMgr.AddArgs(ev.ToolCallID, ev.ArgsDelta)
+			return r.sink(NewToolCallArgsEvent(ev.ToolCallID, ev.ArgsDelta))
 
 		case provider.StreamEndEvent:
 			finishReason = ev.FinishReason
 			usage = ev.Usage
 			if textStarted {
-				return outerSink(NewTextMessageEndEvent(messageID))
+				return r.sink(NewTextMessageEndEvent(messageID))
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("provider chat stream: %w", err)
+		return nil, nil, fmt.Errorf("provider chat stream: %w", err)
 	}
+
+	r.finishReason = finishReason
 
 	// Build assistant message from accumulated content and tool calls
 	var newMessages []Message
@@ -280,7 +280,7 @@ func (a *Agent) processChat(ctx context.Context, model string, messages []Messag
 	if accumulatedContent != "" {
 		parts = append(parts, NewTextPart(accumulatedContent))
 	}
-	toolCalls := toolMgr.GetToolCalls()
+	toolCalls := r.toolMgr.GetToolCalls()
 	for _, tc := range toolCalls {
 		parts = append(parts, NewToolCallPart(tc.ID, tc.Function.Name, tc.Function.Arguments))
 	}
@@ -291,24 +291,23 @@ func (a *Agent) processChat(ctx context.Context, model string, messages []Messag
 		})
 	}
 
-	return finishReason, usage, newMessages, nil
+	return usage, newMessages, nil
 }
 
 // executeToolCalls handles tool execution after the model response.
 // It returns new tool-result messages and the tool results.
-// The approvals map contains approval decisions keyed by tool call ID.
-func (a *Agent) executeToolCalls(ctx context.Context, toolMgr *ToolCallManager, tools []Tool, finishReason provider.FinishReason, approvals map[string]bool, sink EventSink) ([]Message, []ToolResult, error) {
-	if !toolMgr.HasToolCalls() {
+func (r *agentRun) executeToolCalls(approvals map[string]bool) ([]Message, []ToolResult, error) {
+	if !r.toolMgr.HasToolCalls() {
 		return nil, nil, nil
 	}
 
-	toolCalls := toolMgr.GetToolCalls()
+	toolCalls := r.toolMgr.GetToolCalls()
 
 	// If no server-side tools registered or finish reason isn't tool_calls,
 	// emit TOOL_CALL_END without result (client-side tools) and stop.
-	if len(tools) == 0 || finishReason != provider.FinishReasonToolCalls {
+	if len(r.agent.tools) == 0 || r.finishReason != provider.FinishReasonToolCalls {
 		for _, tc := range toolCalls {
-			if err := sink(NewToolCallEndEvent(tc.ID, tc.Function.Name)); err != nil {
+			if err := r.sink(NewToolCallEndEvent(tc.ID, tc.Function.Name)); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -316,16 +315,16 @@ func (a *Agent) executeToolCalls(ctx context.Context, toolMgr *ToolCallManager, 
 	}
 
 	// Execute tools and emit TOOL_CALL_END with results
-	execResult := ExecuteToolCalls(ctx, toolCalls, tools, approvals, a.idGenerator)
+	execResult := ExecuteToolCalls(r.ctx, toolCalls, r.agent.tools, approvals, r.agent.idGenerator)
 
 	// Emit CUSTOM events for tool calls that need approval.
 	for _, req := range execResult.NeedsApproval {
 		endEvent := NewToolCallEndEvent(req.ToolCallID, req.ToolName)
-		if err := sink(endEvent); err != nil {
+		if err := r.sink(endEvent); err != nil {
 			return nil, nil, err
 		}
 
-		if err := sink(NewCustomEvent("approval-requested", map[string]any{
+		if err := r.sink(NewCustomEvent("approval-requested", map[string]any{
 			"toolCallId": req.ToolCallID,
 			"toolName":   req.ToolName,
 			"input":      req.Input,
@@ -343,7 +342,7 @@ func (a *Agent) executeToolCalls(ctx context.Context, toolMgr *ToolCallManager, 
 	for _, result := range execResult.Results {
 		endEvent := NewToolCallEndEvent(result.ToolCallID, result.ToolName)
 		endEvent.Result = result.Content
-		if err := sink(endEvent); err != nil {
+		if err := r.sink(endEvent); err != nil {
 			return nil, nil, err
 		}
 
@@ -362,6 +361,50 @@ func (a *Agent) executeToolCalls(ctx context.Context, toolMgr *ToolCallManager, 
 	}
 
 	return newMessages, execResult.Results, nil
+}
+
+// handleError emits a RUN_ERROR event and calls the OnError hook.
+func (r *agentRun) handleError(err error) error {
+	if r.agent.hooks.OnError != nil {
+		if hookErr := r.agent.hooks.OnError(r.ctx, err); hookErr != nil {
+			return fmt.Errorf("run failed: %w; on error hook: %v", err, hookErr)
+		}
+	}
+
+	_ = r.sink(NewRunErrorEvent(err.Error(), runErrorCode(err), r.runID))
+	return err
+}
+
+// handleSuccess emits a RUN_FINISHED event and calls the OnFinish hook.
+func (r *agentRun) handleSuccess() error {
+	finishedEvent := NewRunFinishedEvent(r.threadID, r.runID, r.finishReason)
+	finishedEvent.Usage = r.totalUsage.toUsage()
+	if err := r.sink(finishedEvent); err != nil {
+		return err
+	}
+
+	if r.agent.hooks.OnFinish != nil {
+		return r.agent.hooks.OnFinish(r.ctx, RunResult{
+			Messages:     r.messages,
+			Usage:        r.totalUsage.toUsage(),
+			FinishReason: r.finishReason,
+			ThreadID:     r.threadID,
+			RunID:        r.runID,
+		})
+	}
+
+	return nil
+}
+
+func runErrorCode(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	default:
+		return "internal_error"
+	}
 }
 
 // extractApprovals scans messages for tool-call parts with approval responses
