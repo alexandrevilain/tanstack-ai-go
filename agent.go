@@ -301,12 +301,10 @@ func (r *agentRun) executeToolCalls(approvals map[string]bool) ([]Message, []Too
 		return nil, nil, nil
 	}
 
-	toolCalls := r.toolMgr.GetToolCalls()
-
 	// If no server-side tools registered or finish reason isn't tool_calls,
 	// emit TOOL_CALL_END without result (client-side tools) and stop.
 	if len(r.agent.tools) == 0 || r.finishReason != provider.FinishReasonToolCalls {
-		for _, tc := range toolCalls {
+		for _, tc := range r.toolMgr.GetToolCalls() {
 			if err := r.sink(NewToolCallEndEvent(tc.ID, tc.Function.Name)); err != nil {
 				return nil, nil, err
 			}
@@ -315,7 +313,7 @@ func (r *agentRun) executeToolCalls(approvals map[string]bool) ([]Message, []Too
 	}
 
 	// Execute tools and emit TOOL_CALL_END with results
-	execResult := ExecuteToolCalls(r.ctx, toolCalls, r.agent.tools, approvals, r.agent.idGenerator)
+	execResult := r.toolMgr.ExecuteToolCalls(r.ctx, r.agent.tools, approvals, r.agent.idGenerator)
 
 	// Emit CUSTOM events for tool calls that need approval.
 	for _, req := range execResult.NeedsApproval {

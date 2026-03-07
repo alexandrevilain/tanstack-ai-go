@@ -105,30 +105,31 @@ type ToolExecutionResult struct {
 	NeedsApproval []ApprovalRequest
 }
 
-// ExecuteToolCalls executes all tool calls against the registered tools.
+// ExecuteToolCalls executes all tracked tool calls against the registered tools.
 // The approvals map contains approval decisions keyed by tool call ID (true = approved, false = denied).
 // Tool calls requiring approval that have no decision in the map are returned in NeedsApproval.
-func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool, approvals map[string]bool, idGenerator IDGenerator) ToolExecutionResult {
+func (m *ToolCallManager) ExecuteToolCalls(ctx context.Context, tools []Tool, approvals map[string]bool, idGenerator IDGenerator) ToolExecutionResult {
 	toolMap := make(map[string]Tool, len(tools))
 	for _, t := range tools {
 		toolMap[t.Name] = t
 	}
 
 	var result ToolExecutionResult
-	for _, tc := range toolCalls {
-		tool, ok := toolMap[tc.Function.Name]
+	for _, id := range m.order {
+		tc := m.calls[id]
+		tool, ok := toolMap[tc.name]
 		if !ok {
 			result.Results = append(result.Results, ToolResult{
-				ToolCallID: tc.ID,
-				ToolName:   tc.Function.Name,
-				Content:    toolErrorContent(fmt.Sprintf("unknown tool: %s", tc.Function.Name)),
+				ToolCallID: tc.id,
+				ToolName:   tc.name,
+				Content:    toolErrorContent(fmt.Sprintf("unknown tool: %s", tc.name)),
 			})
 			continue
 		}
 		if tool.Execute == nil {
 			result.Results = append(result.Results, ToolResult{
-				ToolCallID: tc.ID,
-				ToolName:   tc.Function.Name,
+				ToolCallID: tc.id,
+				ToolName:   tc.name,
 				Content:    toolErrorContent("tool has no server-side execute function"),
 			})
 			continue
@@ -136,19 +137,19 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool, a
 
 		// Handle approval flow for tools that need approval.
 		if tool.NeedsApproval {
-			approved, hasDecision := approvals[tc.ID]
+			approved, hasDecision := approvals[tc.id]
 			if !hasDecision {
 				// Parse input for the approval request.
 				var input any
-				argsStr := tc.Function.Arguments
+				argsStr := tc.args
 				if argsStr == "" {
 					argsStr = "{}"
 				}
 				_ = json.Unmarshal([]byte(argsStr), &input)
 
 				result.NeedsApproval = append(result.NeedsApproval, ApprovalRequest{
-					ToolCallID: tc.ID,
-					ToolName:   tc.Function.Name,
+					ToolCallID: tc.id,
+					ToolName:   tc.name,
 					Input:      input,
 					ApprovalID: idGenerator("approval"),
 				})
@@ -160,8 +161,8 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool, a
 					"message":  "User denied this action",
 				})
 				result.Results = append(result.Results, ToolResult{
-					ToolCallID: tc.ID,
-					ToolName:   tc.Function.Name,
+					ToolCallID: tc.id,
+					ToolName:   tc.name,
 					Content:    string(denied),
 				})
 				continue
@@ -170,14 +171,14 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool, a
 		}
 
 		var args map[string]any
-		argsStr := tc.Function.Arguments
+		argsStr := tc.args
 		if argsStr == "" {
 			argsStr = "{}"
 		}
 		if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
 			result.Results = append(result.Results, ToolResult{
-				ToolCallID: tc.ID,
-				ToolName:   tc.Function.Name,
+				ToolCallID: tc.id,
+				ToolName:   tc.name,
 				Content:    toolErrorContent(fmt.Sprintf("invalid arguments: %s", err)),
 			})
 			continue
@@ -186,8 +187,8 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool, a
 		execResult, err := tool.Execute(ctx, args)
 		if err != nil {
 			result.Results = append(result.Results, ToolResult{
-				ToolCallID: tc.ID,
-				ToolName:   tc.Function.Name,
+				ToolCallID: tc.id,
+				ToolName:   tc.name,
 				Content:    toolErrorContent(err.Error()),
 			})
 			continue
@@ -198,8 +199,8 @@ func ExecuteToolCalls(ctx context.Context, toolCalls []ToolCall, tools []Tool, a
 			encoded = []byte(toolErrorContent(fmt.Sprintf("marshal result: %s", err)))
 		}
 		result.Results = append(result.Results, ToolResult{
-			ToolCallID: tc.ID,
-			ToolName:   tc.Function.Name,
+			ToolCallID: tc.id,
+			ToolName:   tc.name,
 			Content:    string(encoded),
 		})
 	}
