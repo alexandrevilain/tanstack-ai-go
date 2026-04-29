@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/onsi/gomega v1.39.1
+	github.com/onsi/gomega v1.40.0
 	github.com/openai/openai-go v1.12.0
 	github.com/stretchr/testify v1.11.1
 )
@@ -12,6 +12,7 @@ require (
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/tidwall/gjson v1.14.4 // indirect
