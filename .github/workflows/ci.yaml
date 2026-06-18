@@ -21,14 +21,14 @@ jobs:
     name: Check license on files
     runs-on: 'ubuntu-latest'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: check
         run: make check-license
   lint:
     name: Lint files
     runs-on: 'ubuntu-latest'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: 'go.mod'
@@ -41,7 +41,7 @@ jobs:
     name: Test
     runs-on: 'ubuntu-latest'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: 'go.mod'
