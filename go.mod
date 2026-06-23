@@ -1,10 +1,10 @@
 module github.com/alexandrevilain/tanstack-ai-go
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/onsi/gomega v1.39.1
+	github.com/onsi/gomega v1.42.1
 	github.com/openai/openai-go v1.12.0
 	github.com/stretchr/testify v1.11.1
 )
@@ -19,7 +19,7 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/net v0.49.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
